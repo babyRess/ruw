@@ -50,6 +50,23 @@ impl ApiState {
             .map(Self::with_database)
     }
 
+    /// Open SQLite state only when a database URL is configured.
+    ///
+    /// `None` or a blank URL returns default framework state. This keeps apps
+    /// that support optional persistence from having to branch around
+    /// [`ApiState`] setup themselves.
+    pub async fn connect_optional_sqlite(database_url: Option<impl AsRef<str>>) -> ApiResult<Self> {
+        let Some(database_url) = database_url else {
+            return Ok(Self::default());
+        };
+
+        if database_url.as_ref().trim().is_empty() {
+            Ok(Self::default())
+        } else {
+            Self::connect_sqlite(database_url).await
+        }
+    }
+
     /// Access the configured framework-managed database connection.
     ///
     /// A missing database is treated as a framework state error rather than a
@@ -116,6 +133,26 @@ where
 
     /// Return the id used to build a successful create `Location` header.
     fn resource_id(&self, resource: &Self::Resource) -> Self::Id;
+}
+
+/// Ordinary-Rust read-only controller contract adapted by [`Api::read_only_resource`].
+///
+/// Use this when a resource exposes collection/member reads but should not
+/// commit to create, update, or delete behavior.
+pub trait ReadOnlyResourceController<S = ApiState>: Clone + Send + Sync + 'static
+where
+    S: Clone + Send + Sync + 'static,
+{
+    /// Path identifier parsed by Axum's typed [`Path`] extractor.
+    type Id: DeserializeOwned + Display + Send + Sync + 'static;
+    /// Public JSON resource returned to callers.
+    type Resource: Serialize + Send + Sync + 'static;
+
+    /// List resources for the collection route.
+    fn index(&self, state: S) -> ControllerFuture<'_, Vec<Self::Resource>>;
+
+    /// Fetch one resource by id. `None` is mapped through the not-found seam.
+    fn show(&self, state: S, id: Self::Id) -> ControllerFuture<'_, Option<Self::Resource>>;
 }
 
 struct ResourcePath<T>(T);
@@ -271,6 +308,39 @@ where
         self
     }
 
+    /// Register read-only collection and member routes for a controller.
+    ///
+    /// The collection path receives `GET`; the member path appends Axum 0.8
+    /// `{id}` syntax and receives `GET`.
+    pub fn read_only_resource<C>(mut self, path: &str, controller: C) -> Self
+    where
+        C: ReadOnlyResourceController<S>,
+    {
+        let collection_path = normalize_resource_path(path);
+        let member_path = member_resource_path(&collection_path);
+
+        let index_controller = controller.clone();
+        let show_controller = controller;
+
+        let collection_routes = axum::routing::get(move |State(state): State<S>| {
+            let controller = index_controller.clone();
+            async move { read_only_resource_index(controller, state).await }
+        });
+
+        let member_routes = axum::routing::get(
+            move |ResourcePath(id): ResourcePath<C::Id>, State(state): State<S>| {
+                let controller = show_controller.clone();
+                async move { read_only_resource_show(controller, state, id).await }
+            },
+        );
+
+        self.router = self
+            .router
+            .route(&collection_path, collection_routes)
+            .route(&member_path, member_routes);
+        self
+    }
+
     /// Finalize this API into a normal Axum router by applying the owned state.
     pub fn into_router(self) -> axum::Router {
         self.router.with_state(self.state)
@@ -283,12 +353,12 @@ where
 }
 
 fn normalize_resource_path(path: &str) -> String {
-    let path = path.trim_end_matches('/');
+    let path = path.trim().trim_end_matches('/').trim_start_matches('/');
 
     if path.is_empty() {
         "/".to_owned()
     } else {
-        path.to_owned()
+        format!("/{path}")
     }
 }
 
@@ -311,6 +381,32 @@ where
 async fn resource_show<C, S>(controller: C, state: S, id: C::Id) -> ApiResult<Json<C::Resource>>
 where
     C: ResourceController<S>,
+    S: Clone + Send + Sync + 'static,
+{
+    match controller.show(state, id).await? {
+        Some(resource) => Ok(Json(resource)),
+        None => Err(resource_not_found("show")),
+    }
+}
+
+async fn read_only_resource_index<C, S>(
+    controller: C,
+    state: S,
+) -> ApiResult<Json<Vec<C::Resource>>>
+where
+    C: ReadOnlyResourceController<S>,
+    S: Clone + Send + Sync + 'static,
+{
+    controller.index(state).await.map(Json)
+}
+
+async fn read_only_resource_show<C, S>(
+    controller: C,
+    state: S,
+    id: C::Id,
+) -> ApiResult<Json<C::Resource>>
+where
+    C: ReadOnlyResourceController<S>,
     S: Clone + Send + Sync + 'static,
 {
     match controller.show(state, id).await? {
@@ -429,6 +525,41 @@ mod tests {
         let state = ApiState::connect_sqlite("sqlite::memory:")
             .await
             .expect("in-memory SQLite should connect");
+
+        state
+            .database()
+            .expect("database should be configured")
+            .execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT 1".to_owned(),
+            ))
+            .await
+            .expect("database should execute a simple query");
+    }
+
+    #[tokio::test]
+    async fn api_state_connect_optional_sqlite_defaults_without_url() {
+        let state = ApiState::connect_optional_sqlite(None::<&str>)
+            .await
+            .expect("missing database URL should produce default state");
+
+        assert!(matches!(state.database(), Err(ApiError::Internal)));
+    }
+
+    #[tokio::test]
+    async fn api_state_connect_optional_sqlite_defaults_for_blank_url() {
+        let state = ApiState::connect_optional_sqlite(Some("   "))
+            .await
+            .expect("blank database URL should produce default state");
+
+        assert!(matches!(state.database(), Err(ApiError::Internal)));
+    }
+
+    #[tokio::test]
+    async fn api_state_connect_optional_sqlite_opens_configured_database() {
+        let state = ApiState::connect_optional_sqlite(Some("sqlite::memory:"))
+            .await
+            .expect("configured database URL should connect");
 
         state
             .database()

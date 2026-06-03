@@ -36,6 +36,7 @@ __pycache__/
 .venv/
 venv/
 target/
+todo-list-api/
 vendor/
 *.log
 coverage/

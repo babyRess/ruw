@@ -158,6 +158,38 @@ impl ResourceController<ControllerRouteState> for ControllerRouteTodos {
     }
 }
 
+#[derive(Clone)]
+struct ReadOnlyRouteTodos;
+
+impl ReadOnlyResourceController<ControllerRouteState> for ReadOnlyRouteTodos {
+    type Id = u64;
+    type Resource = ControllerRouteTodo;
+
+    fn index(&self, state: ControllerRouteState) -> ControllerFuture<'_, Vec<Self::Resource>> {
+        Box::pin(async move {
+            let store = state
+                .store
+                .lock()
+                .expect("store mutex should not be poisoned");
+            Ok(store.todos.clone())
+        })
+    }
+
+    fn show(
+        &self,
+        state: ControllerRouteState,
+        id: Self::Id,
+    ) -> ControllerFuture<'_, Option<Self::Resource>> {
+        Box::pin(async move {
+            let store = state
+                .store
+                .lock()
+                .expect("store mutex should not be poisoned");
+            Ok(store.todos.iter().find(|todo| todo.id == id).cloned())
+        })
+    }
+}
+
 #[tokio::test]
 async fn stateful_route_returns_json() {
     async fn stateful_handler(State(state): State<TestState>) -> Json<Value> {
@@ -294,6 +326,67 @@ async fn controller_routes_register_collection_and_member_crud_routes() {
 
     let response = call(app, "/todos/1").await;
     assert!(!response.status().is_success());
+}
+
+#[tokio::test]
+async fn controller_routes_accept_paths_without_leading_slash() {
+    let state = ControllerRouteState::default();
+    let app = Api::new(state)
+        .resource("todos/", ControllerRouteTodos)
+        .into_router();
+
+    let response = json_request(
+        app,
+        Method::POST,
+        "/todos",
+        json!({ "title": "normalize resource paths" }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/todos/1")
+    );
+}
+
+#[tokio::test]
+async fn read_only_resource_registers_collection_and_member_get_routes() {
+    let state = ControllerRouteState::default();
+    {
+        let mut store = state
+            .store
+            .lock()
+            .expect("store mutex should not be poisoned");
+        store.todos.push(ControllerRouteTodo {
+            id: 7,
+            title: "read only route".to_owned(),
+            completed: false,
+        });
+    }
+
+    let app = Api::new(state)
+        .read_only_resource("/todos", ReadOnlyRouteTodos)
+        .into_router();
+
+    let response = call(app.clone(), "/todos").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_json_content_type(&response);
+    assert_eq!(
+        json_body(response).await,
+        json!([{ "id": 7, "title": "read only route", "completed": false }])
+    );
+
+    let response = call(app, "/todos/7").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_json_content_type(&response);
+    assert_eq!(
+        json_body(response).await,
+        json!({ "id": 7, "title": "read only route", "completed": false })
+    );
 }
 
 #[tokio::test]

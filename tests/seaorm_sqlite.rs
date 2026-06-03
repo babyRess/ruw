@@ -1,4 +1,4 @@
-#[path = "../examples/todos_api/entity.rs"]
+#[path = "support/todos_entity.rs"]
 mod todos_entity;
 
 use ruw::{

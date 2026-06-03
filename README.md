@@ -81,6 +81,16 @@ Handlers and controllers access the stored connection with `state.database()?`; 
 
 Resource code owns its own SeaORM queries. `ruw` provides state plumbing and response conversion, not a generic repository layer or automatic ORM abstraction.
 
+When persistence is optional, use `ApiState::connect_optional_sqlite(database_url).await?`.
+Passing `None` or a blank URL returns default state, while `Some("sqlite://...")`
+opens the database and stores it in `ApiState`. This keeps environment-driven
+setup compact:
+
+```rust
+let database_url = std::env::var("DATABASE_URL").ok();
+let state = ApiState::connect_optional_sqlite(database_url.as_deref()).await?;
+```
+
 ## Controller CRUD routes
 
 Use `ResourceController` when a resource should expose conventional CRUD routes without procedural macros. A controller is an ordinary cloneable Rust type with typed associated types for its path id, public JSON resource, create DTO, and update DTO. Each method returns a boxed `ControllerFuture` so the public API does not require an `async-trait` dependency.
@@ -168,7 +178,7 @@ let app = Api::new(state)
 # Ok::<(), ruw::ApiError>(())
 ```
 
-`Api::resource("/todos", TodosController)` registers the collection route and the member route once. Member routes use Axum 0.8 `{id}` path syntax, not the older `:id` syntax.
+`Api::resource("/todos", TodosController)` registers the collection route and the member route once. Resource paths are normalized, so `resource("todos", ...)`, `resource("/todos", ...)`, and `resource("/todos/", ...)` all mount the same public paths. Member routes use Axum 0.8 `{id}` path syntax, not the older `:id` syntax.
 
 | Method | Path | Controller method | Success behavior |
 |---|---|---|---|
@@ -181,6 +191,8 @@ let app = Api::new(state)
 `validate_create` and `validate_update` are optional synchronous hooks. They run after framework-owned JSON/path extraction succeeds and before `create` or `update` mutates state; returning `ApiError::ValidationFailed` renders the stable `422` problem body without calling the mutation method.
 
 Typed ids and JSON bodies for `Api::resource` routes are parsed through framework-owned extractors before controller code runs. Malformed member ids, malformed JSON syntax, wrong JSON value types, and missing JSON content types map to the stable `400 bad_request` problem response and stop before resource mutation. Raw Axum routes registered with `Api::route` or `Api::merge` remain an escape hatch: they keep Axum's normal extractor behavior unless the application deliberately uses framework helpers in those routes.
+
+Use `ReadOnlyResourceController` with `Api::read_only_resource` when a resource should expose only `GET /resources` and `GET /resources/{id}`. It keeps the same typed id, JSON response, not-found, and bad-path behavior without forcing placeholder create, update, or delete methods into a read-only domain.
 
 ## Public JSON problem contract
 
@@ -205,44 +217,22 @@ The `status` field is the numeric HTTP status, `error` is the stable machine-rea
 
 The framework deliberately does not echo path fragments, raw request bodies, validation input values, SQL statements, SQLite paths, connection strings, table names, raw SeaORM messages, or framework-state labels in public problem bodies. Those details are diagnostics-only: `tracing` records structured categories such as `error_kind = "bad_request"`, `"validation_failed"`, `"not_found"`, `"database"`, or `"framework_state"` so future agents can inspect internals without changing the client-visible contract.
 
-## Running the todos API example
+## Todo app repository
 
-The live todos example wires `Api::resource`, `ResourceController<ApiState>`, SeaORM SQLite, and the public JSON problem contract into a real Axum process. It is local-only, unauthenticated, SQLite-only, and intentionally does not add code generators, auth, migrations, or production lifecycle management.
+The standalone todo application now lives outside this framework crate at `babyRess/ruw-todo-list`. That repository contains the Rust API and Svelte frontend as a real app, while this crate keeps only the reusable framework, generator, and test fixtures.
 
-By default the example listens on `127.0.0.1:3000` and stores data in `target/todos_api/todos.sqlite`:
+The framework route contract remains covered by integration tests against an isolated in-memory SQLite database. The todo app repository owns the browser-facing UI and runtime app behavior.
 
-```sh
-cargo run --example todos_api
-```
+## Generator CLI
 
-The startup log prints the actual bound URL as `todos_api listening on http://...`. Override both runtime inputs when you want an isolated port and database file:
+The `ruw` binary includes a small scaffold generator:
 
 ```sh
-RUW_TODOS_ADDR=127.0.0.1:0 \
-RUW_TODOS_DATABASE_URL="sqlite://target/todos_api/dev.sqlite?mode=rwc" \
-cargo run --example todos_api
+ruw new ./my-app
+ruw generate resource Todo --path ./my-app title:string completed:boolean
 ```
 
-Use the following endpoints against the printed base URL:
-
-| Method | Path | Request body | Success behavior |
-|---|---|---|---|
-| `GET` | `/health` | none | `200 OK` with `{"status":"ok"}` after a lightweight database check. |
-| `GET` | `/todos` | none | `200 OK` with a JSON array ordered by id. |
-| `POST` | `/todos` | `{"title":"ship docs"}` | `201 Created` with the created todo, `completed: false`, and `Location: /todos/{id}`. |
-| `GET` | `/todos/{id}` | none | `200 OK` with one todo, or the sanitized `404` problem body when missing. |
-| `PATCH` | `/todos/{id}` | `{"title":"ship verified docs","completed":true}` | `200 OK` with the updated todo, or the sanitized `404` problem body when missing. |
-| `DELETE` | `/todos/{id}` | none | `204 No Content` with an empty body, or the sanitized `404` problem body when missing. |
-
-Malformed member ids, malformed JSON, wrong JSON types, and missing JSON content types are framework-owned extractor failures and return the canonical `400 bad_request` problem response. Blank create or update titles are rejected by the controller validation hooks before mutation and return `422 validation_failed`. Database or other internal failures return the sanitized `500 internal_server_error` problem response; public bodies do not expose SQL, SQLite paths, connection strings, table names, or raw SeaORM diagnostics.
-
-For final local verification, run:
-
-```sh
-python3 scripts/verify_todos_api.py
-```
-
-The verifier starts `cargo run --example todos_api` as a child process with `RUW_TODOS_ADDR=127.0.0.1:0` and an isolated temporary SQLite database, waits for `/health`, then exercises create, list, fetch, update, delete, representative `400`, `404`, `422`, and sanitized `500` behavior over real HTTP. Successful runs clean up their temporary directory; failures print and retain the child-process log path so startup, bind, schema, HTTP, and response-contract issues can be inspected later.
+`ruw new` creates `Cargo.toml` and `src/main.rs` for a minimal health-check API. `ruw generate resource` writes a non-overwriting `src/<resource>.rs` in-memory `ResourceController` module with typed create/update DTOs and a ready `api(state)` helper. Generated resources reserve `id` for the framework scaffold and reject Rust keywords in generated identifiers.
 
 ## Public surface in this slice
 
@@ -250,10 +240,12 @@ The verifier starts `cargo run --example todos_api` as a child process with `RUW
 - `Api::route` accepts normal Axum `MethodRouter<S>` values.
 - `Api::merge` accepts raw `axum::Router<S>` values as an escape hatch.
 - `Api::resource` expands one `ResourceController` into conventional collection and member CRUD routes.
+- `Api::read_only_resource` expands one `ReadOnlyResourceController` into collection and member read routes.
 - `Api::into_router` applies the owned state with Axum's `with_state` and returns a standard `axum::Router`.
 - `ApiState` is the default cloneable framework state placeholder and can carry a SeaORM SQLite `DatabaseConnection`.
 - `ApiState::connect_sqlite`, `ApiState::with_database`, and `ApiState::database` provide the explicit framework-managed database path.
-- `ResourceController` and `ControllerFuture` define the macro-light controller adapter contract.
+- `ResourceController`, `ReadOnlyResourceController`, and `ControllerFuture` define the macro-light controller adapter contracts.
+- `ruw new` and `ruw generate resource` provide non-overwriting project and resource scaffold paths.
 - `ruw::connect_sqlite` opens a SQLite SeaORM connection outside state when needed.
 - `ruw::sea_orm` re-exports SeaORM for explicit resource-specific queries.
 - `ApiResult`, `ApiError`, and `Problem` define the framework error seam. Framework-owned resource extractor failures, validation failures, not-found results, internal errors, missing database state, and database errors produce stable sanitized JSON while tracing diagnostics internally.
@@ -261,15 +253,15 @@ The verifier starts `cargo run --example todos_api` as a child process with `RUW
 
 ## Verification surfaces
 
-- `cargo test controller_routes` proves the public `ResourceController` trait and `Api::resource` adapter register collection and member routes with typed path and JSON extraction.
+- `cargo test controller_routes` proves the public `ResourceController`, `ReadOnlyResourceController`, `Api::resource`, and `Api::read_only_resource` adapters register collection and member routes with typed path and JSON extraction.
+- `cargo test cli_run` proves the generator writes project/resource scaffolds and refuses unsafe overwrites.
 - `cargo test controller_crud` proves a SQLite-backed todos controller can create, list, fetch, update, delete, return `Location`, return `204 No Content`, reject malformed inputs without mutation, and preserve sanitized problem responses.
 - `cargo test json_error_contract` proves malformed framework-owned resource path and JSON extractor failures return canonical `400 bad_request` JSON and do not call or mutate the controller.
 - `cargo test json_response_contract` proves the resource-route response matrix for `200`, `201` with `Location`, `204` empty delete, `400`, `404`, `422`, and sanitized `500` through Axum/Tower service tests against isolated in-memory SQLite.
 - `cargo test seaorm_sqlite` is the focused database-substrate and redaction check.
-- `cargo check --example todos_api` proves the runnable example compiles against the public facade and SQLite dependencies.
-- `python3 scripts/verify_todos_api.py` proves the live `cargo run --example todos_api` process over localhost TCP with an isolated SQLite file.
-- Slice closeout uses `cargo check --example todos_api && cargo fmt --check && cargo test && python3 scripts/verify_todos_api.py` to re-verify the facade, SeaORM substrate, controller adapter, JSON contract, error redaction behavior, and live example together.
+- `cargo clippy --all-targets --all-features -- -D warnings` proves the library, CLI, and integration surfaces stay warning-clean.
+- Slice closeout uses `cargo fmt --check && cargo test && cargo clippy --all-targets --all-features -- -D warnings` to re-verify the facade, SeaORM substrate, controller adapter, JSON contract, error redaction behavior, and generator together.
 
 ## Current boundary
 
-This milestone currently proves the Axum facade, typed state flow, raw-route merge path, SeaORM SQLite substrate, reusable Todos entity fixture, controller CRUD registration, SQLite-backed controller lifecycle, stable JSON success/error contract through service tests, and a live HTTP `todos_api` process through network-level verification. Framework-owned resource routes now have documented public behavior for successful CRUD, malformed extractor input, semantic validation failures, missing resources, and sanitized internal/database failures. The shipped scope remains a local unauthenticated API facade and SQLite example; auth, generators, migrations, non-SQLite databases, and production lifecycle management are outside M001.
+This milestone currently proves the Axum facade, typed state flow, raw-route merge path, SeaORM SQLite substrate, reusable Todos test fixture, controller CRUD/read-only registration, SQLite-backed controller lifecycle, stable JSON success/error contract through service tests, and generator scaffold writes. Framework-owned resource routes now have documented public behavior for successful CRUD, read-only routes, malformed extractor input, semantic validation failures, missing resources, and sanitized internal/database failures. The shipped scope remains a local unauthenticated API facade and scaffold generator; auth, migrations, non-SQLite databases, and production lifecycle management are outside M001.
